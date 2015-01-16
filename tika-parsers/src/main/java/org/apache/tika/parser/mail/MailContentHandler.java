@@ -31,6 +31,7 @@ import org.apache.james.mime4j.dom.field.DateTimeField;
 import org.apache.james.mime4j.dom.field.MailboxListField;
 import org.apache.james.mime4j.dom.field.ParsedField;
 import org.apache.james.mime4j.dom.field.UnstructuredField;
+import org.apache.james.mime4j.field.ContentDispositionFieldLenientImpl;
 import org.apache.james.mime4j.field.LenientFieldParser;
 import org.apache.james.mime4j.parser.ContentHandler;
 import org.apache.james.mime4j.stream.BodyDescriptor;
@@ -60,7 +61,9 @@ class MailContentHandler implements ContentHandler {
     private Metadata metadata;
     private TikaConfig tikaConfig = null;
 
-    private boolean inPart = false;
+    private boolean inMultiPart = false;
+    private String bodyPartName;
+
     
     MailContentHandler(XHTMLContentHandler xhtml, Metadata metadata, ParseContext context, boolean strictParsing) {
         this.handler = xhtml;
@@ -107,6 +110,10 @@ class MailContentHandler implements ContentHandler {
         submd.set(Metadata.CONTENT_TYPE, body.getMimeType());
         submd.set(Metadata.CONTENT_ENCODING, body.getCharset());
 
+        if (bodyPartName != null) {
+            submd.set(Metadata.RESOURCE_NAME_KEY, bodyPartName);
+        }
+
         try {
             if (ex.shouldParseEmbedded(submd)) {
                 ex.parseEmbedded(is, handler, submd, false);
@@ -120,6 +127,7 @@ class MailContentHandler implements ContentHandler {
         try {
             handler.endElement("p");
             handler.endElement("div");
+            bodyPartName = null;
         } catch (SAXException e) {
             throw new MimeException(e);
         }
@@ -145,7 +153,6 @@ class MailContentHandler implements ContentHandler {
     }
 
     public void endMultipart() throws MimeException {
-        inPart = false;
     }
 
     public void epilogue(InputStream is) throws MimeException, IOException {
@@ -158,53 +165,67 @@ class MailContentHandler implements ContentHandler {
      *      Field.html
      **/
     public void field(Field field) throws MimeException {
-        // inPart indicates whether these metadata correspond to the
-        // whole message or its parts
-        if (inPart) {
-            return;
-        }
 
         try {
-            String fieldname = field.getName();
-            ParsedField parsedField = LenientFieldParser.getParser().parse(
-                    field, DecodeMonitor.SILENT);
-            if (fieldname.equalsIgnoreCase("From")) {
-                MailboxListField fromField = (MailboxListField) parsedField;
-                MailboxList mailboxList = fromField.getMailboxList();
-                if (fromField.isValidField() && mailboxList != null) {
-                    for (Address address : mailboxList) {
-                        String from = getDisplayString(address);
-                        metadata.add(Metadata.MESSAGE_FROM, from);
-                        metadata.add(TikaCoreProperties.CREATOR, from);
-                    }
-                } else {
-                    String from = stripOutFieldPrefix(field, "From:");
-                    if (from.startsWith("<")) {
-                        from = from.substring(1);
-                    }
-                    if (from.endsWith(">")) {
-                        from = from.substring(0, from.length() - 1);
-                    }
-                    metadata.add(Metadata.MESSAGE_FROM, from);
-                    metadata.add(TikaCoreProperties.CREATOR, from);
-                }
-            } else if (fieldname.equalsIgnoreCase("Subject")) {
-                metadata.add(TikaCoreProperties.TRANSITION_SUBJECT_TO_DC_TITLE,
-                        ((UnstructuredField) parsedField).getValue());
-            } else if (fieldname.equalsIgnoreCase("To")) {
-                processAddressList(parsedField, "To:", Metadata.MESSAGE_TO);
-            } else if (fieldname.equalsIgnoreCase("CC")) {
-                processAddressList(parsedField, "Cc:", Metadata.MESSAGE_CC);
-            } else if (fieldname.equalsIgnoreCase("BCC")) {
-                processAddressList(parsedField, "Bcc:", Metadata.MESSAGE_BCC);
-            } else if (fieldname.equalsIgnoreCase("Date")) {
-                DateTimeField dateField = (DateTimeField) parsedField;
-                metadata.set(TikaCoreProperties.CREATED, dateField.getDate());
+            if (!inMultiPart) {
+                processMessageField(field);
+            }
+            else {
+                processAttachmentField(field);
             }
         } catch (RuntimeException me) {
             if (strictParsing) {
                 throw me;
             }
+        }
+    }
+
+    private void processMessageField(Field field) throws MimeException {
+        String fieldname = field.getName();
+        ParsedField parsedField = LenientFieldParser.getParser().parse(
+                field, DecodeMonitor.SILENT);
+        if (fieldname.equalsIgnoreCase("From")) {
+            MailboxListField fromField = (MailboxListField) parsedField;
+            MailboxList mailboxList = fromField.getMailboxList();
+            if (fromField.isValidField() && mailboxList != null) {
+                for (Address address : mailboxList) {
+                    String from = getDisplayString(address);
+                    metadata.add(Metadata.MESSAGE_FROM, from);
+                    metadata.add(TikaCoreProperties.CREATOR, from);
+                }
+            } else {
+                String from = stripOutFieldPrefix(field, "From:");
+                if (from.startsWith("<")) {
+                    from = from.substring(1);
+                }
+                if (from.endsWith(">")) {
+                    from = from.substring(0, from.length() - 1);
+                }
+                metadata.add(Metadata.MESSAGE_FROM, from);
+                metadata.add(TikaCoreProperties.CREATOR, from);
+            }
+        } else if (fieldname.equalsIgnoreCase("Subject")) {
+            metadata.add(TikaCoreProperties.TRANSITION_SUBJECT_TO_DC_TITLE,
+                    ((UnstructuredField) parsedField).getValue());
+        } else if (fieldname.equalsIgnoreCase("To")) {
+            processAddressList(parsedField, "To:", Metadata.MESSAGE_TO);
+        } else if (fieldname.equalsIgnoreCase("CC")) {
+            processAddressList(parsedField, "Cc:", Metadata.MESSAGE_CC);
+        } else if (fieldname.equalsIgnoreCase("BCC")) {
+            processAddressList(parsedField, "Bcc:", Metadata.MESSAGE_BCC);
+        } else if (fieldname.equalsIgnoreCase("Date")) {
+            DateTimeField dateField = (DateTimeField) parsedField;
+            metadata.set(TikaCoreProperties.CREATED, dateField.getDate());
+        }
+    }
+
+    private void processAttachmentField(Field field) {
+        String fieldname = field.getName();
+        ParsedField parsedField = LenientFieldParser.getParser().parse(
+                field, DecodeMonitor.SILENT);
+
+        if (fieldname.equalsIgnoreCase("Content-Disposition")) {
+            bodyPartName = ((ContentDispositionFieldLenientImpl) parsedField).getFilename();
         }
     }
 
@@ -261,7 +282,7 @@ class MailContentHandler implements ContentHandler {
     }
 
     public void startMultipart(BodyDescriptor descr) throws MimeException {
-        inPart = true;
+        inMultiPart = true;
     }
 
     private String stripOutFieldPrefix(Field field, String fieldname) {
